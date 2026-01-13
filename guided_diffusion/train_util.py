@@ -8,20 +8,24 @@ import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 
-from . import dist_util, logger
+from . import dist_util, logger, validation_plots
 from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
 from visdom import Visdom
-viz = Visdom(port=8850)
+from tqdm.auto import tqdm
+# viz = Visdom(port=8850)
+viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
+import numpy as np
 
 INITIAL_LOG_LOSS_SCALE = 20.0
 
 def visualize(img):
-    _min = img.min()
-    _max = img.max()
-    normalized_img = (img - _min)/ (_max - _min)
-    return normalized_img
+    return np.clip(img, -1, 1)
+    _min = img.min(axis=(1, 2, 3))
+    _max = img.max(axis=(1, 2, 3))
+    normalized_img = (img.T - _min)/ (_max - _min)
+    return normalized_img.T
 
 class TrainLoop:
     def __init__(
@@ -30,25 +34,28 @@ class TrainLoop:
         model,
         diffusion,
         data,
+        validation,
         batch_size,
         microbatch,
         lr,
         ema_rate,
         log_interval,
+        validation_interval,
         save_interval,
+        plot_interval,
         resume_checkpoint,
         use_fp16=False,
+        weight_batches=False,
+        weight_pixels=False,
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        dataset='brats',
     ):
         self.model = model
         self.diffusion = diffusion
         self.datal = data
-        self.dataset=dataset
-        self.iterdatal = iter(data)
+        self.validationl = validation
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -58,13 +65,17 @@ class TrainLoop:
             else [float(x) for x in ema_rate.split(",")]
         )
         self.log_interval = log_interval
+        self.validation_interval = validation_interval
         self.save_interval = save_interval
+        self.plot_interval = plot_interval
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.weight_batches = weight_batches
+        self.weight_pixels = weight_pixels
 
         self.step = 0
         self.resume_step = 0
@@ -161,48 +172,78 @@ class TrainLoop:
     def run_loop(self):
         i = 0
 
+        pbar = tqdm()
         while (
             not self.lr_anneal_steps
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
-            if self.dataset=='brats':
-                try:
-                    batch, cond, label = next(self.iterdatal)
-                except:
-                    self.iterdatal = iter(self.datal)
-                    batch, cond, label, _, _ = next(self.iterdatal)
-            elif self.dataset=='chexpert':
-                batch, cond = next(self.datal)
-                cond.pop("path", None)
+            batch, cond = next(self.datal)
+            cond.pop("path", None)
+            bw = cond.pop("weight", None)
+            pw = cond.pop("pixel_weight", None)
+            batch_weights = None if not self.weight_batches else bw
+            pixel_weights = None if not self.weight_pixels else pw
 
-            self.run_step(batch, cond)
+            self.run_step(batch, cond, batch_weights=batch_weights, pixel_weights=pixel_weights)
+
+            if self.step % self.validation_interval == 0:
+                vbatch, vcond = next(self.validationl)
+                vcond.pop("path", None)
+                bw = vcond.pop("weight", None)
+                pw = vcond.pop("pixel_weight", None)
+                vbatch_weights = None if not self.weight_batches else bw
+                vpixel_weights = None if not self.weight_pixels else pw
+                self.run_validation_step(vbatch, vcond, batch_weights=vbatch_weights, pixel_weights=vpixel_weights)
 
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+
+            if self.step % self.save_interval == 0 and self.step > 0:
                 self.save()
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
+
+            if self.step % self.plot_interval == 0 and self.step > 0:
+                # make validation plots
+                vbatch, _ = next(self.validationl)
+                for ibatch in range(min(4, vbatch.shape[0])):
+                    outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddpm/img-%i/" % (self.step, ibatch)
+                    os.makedirs(outdir, exist_ok=True)
+                    with th.no_grad():
+                        validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch])
+                for ibatch in range(min(4, vbatch.shape[0])):
+                    outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddim/img-%i/" % (self.step, ibatch)
+                    os.makedirs(outdir, exist_ok=True)
+                    with th.no_grad():
+                        validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch], ddpm=False)
+
             self.step += 1
+            pbar.update(1)
+
+        pbar.close()
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, cond):
-        lossmse,  sample = self.forward_backward(batch, cond)
+    def run_validation_step(self, batch, cond, batch_weights=None, pixel_weights=None):
+        with th.no_grad():
+            self.forward_backward(batch, cond, validation=True, batch_weights=batch_weights, pixel_weights=pixel_weights)
+
+    def run_step(self, batch, cond, batch_weights=None, pixel_weights=None):
+        self.forward_backward(batch, cond, batch_weights=batch_weights, pixel_weights=pixel_weights)
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
-        return lossmse,  sample
 
-    def forward_backward(self, batch, cond):
+    def forward_backward(self, batch, cond, validation=False, batch_weights=None, pixel_weights=None):
         self.mp_trainer.zero_grad()
+        all_losses = {}
+        ts = th.empty(0)
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            print('micro', micro.shape)
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
@@ -210,39 +251,52 @@ class TrainLoop:
        
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            if batch_weights is not None: 
+                weights = weights * batch_weights[i : i + self.microbatch].to(dist_util.dev())
+            pweights = None if pixel_weights is None else pixel_weights[i : i + self.microbatch].to(dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
                 micro,
                 t,
+                pixel_wgt=pweights,
                 model_kwargs=micro_cond,
             )
 
             if last_batch or not self.use_ddp:
                 losses1 = compute_losses()
-
+                losses = losses1[0]
+                loss = (losses["loss"] * weights).mean()
+                if not validation:
+                    self.mp_trainer.backward(loss)
             else:
                 with self.ddp_model.no_sync():
                     losses1 = compute_losses()
+                    losses = losses1[0]
+                    loss = (losses["loss"] * weights).mean()
+                    if not validation:
+                        self.mp_trainer.backward(loss)
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
                     t, losses["loss"].detach()
                 )
-            losses = losses1[0]
-            sample = losses1[1]
 
-            loss = (losses["loss"] * weights).mean()
+            # Keep track of the losses for logging
+            for k, v in losses.items():
+                w_v = weights*v
+                if k in all_losses:
+                    all_losses[k] = th.cat([all_losses[k], w_v.detach()], dim=0)
+                else:
+                    all_losses[k] = w_v.detach()
+            ts = th.cat([ts, t.detach().cpu()])
 
-            lossmse = (losses["mse"] * weights).mean().detach()
-           
-            log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
-            )
-            self.mp_trainer.backward(loss)
 
-            return lossmse.detach(),  sample
+        log_loss_dict(
+            self.diffusion, ts, all_losses,
+            validation=validation
+        )
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):
@@ -284,7 +338,7 @@ class TrainLoop:
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
-        dist.barrier()
+        dist.barrier(device_ids=[0])
 
 
 def parse_resume_step_from_filename(filename):
@@ -324,10 +378,11 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     return None
 
 
-def log_loss_dict(diffusion, ts, losses):
+def log_loss_dict(diffusion, ts, losses, validation=False):
+    prefix = "val-" if validation else ""
     for key, values in losses.items():
         logger.logkv_mean(key, values.mean().item())
         # Log the quantiles (four quartiles, in particular).
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
-            logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+            logger.logkv_mean(f"{prefix}{key}_q{quartile}", sub_loss)

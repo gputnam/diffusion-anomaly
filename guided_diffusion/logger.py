@@ -158,33 +158,28 @@ class TensorBoardOutputFormat(KVWriter):
         self.step = 1
         prefix = "events"
         path = osp.join(osp.abspath(dir), prefix)
-        import tensorflow as tf
-        from tensorflow.python import pywrap_tensorflow
-        from tensorflow.core.util import event_pb2
-        from tensorflow.python.util import compat
+        from torch.utils.tensorboard import SummaryWriter
 
-        self.tf = tf
-        self.event_pb2 = event_pb2
-        self.pywrap_tensorflow = pywrap_tensorflow
-        self.writer = pywrap_tensorflow.EventsWriter(compat.as_bytes(path))
+        self.writer = SummaryWriter(path)
 
     def writekvs(self, kvs):
-        def summary_val(k, v):
-            kwargs = {"tag": k, "simple_value": float(v)}
-            return self.tf.Summary.Value(**kwargs)
+        keys = list(kvs.keys())
+        keytypes = [k.split("_")[0] for k in keys]
+        keytype_map = {}
+        for k,kt in zip(keys, keytypes):
+            if kt not in keytype_map.keys():
+                keytype_map[kt] = [k]
+            else:
+                keytype_map[kt].append(k)
 
-        summary = self.tf.Summary(value=[summary_val(k, v) for k, v in kvs.items()])
-        event = self.event_pb2.Event(wall_time=time.time(), summary=summary)
-        event.step = (
-            self.step
-        )  # is there any reason why you'd want to specify the step?
-        self.writer.WriteEvent(event)
-        self.writer.Flush()
+        for ktype in keytype_map.keys():
+            self.writer.add_scalars(ktype, dict([(k, kvs[k]) for k in keytype_map[ktype]]), self.step)
+
         self.step += 1
 
     def close(self):
         if self.writer:
-            self.writer.Close()
+            self.writer.close()
             self.writer = None
 
 
@@ -460,7 +455,7 @@ def configure(dir='./results', format_strs=None, comm=None, log_suffix=""):
 
     if format_strs is None:
         if rank == 0:
-            format_strs = os.getenv("OPENAI_LOG_FORMAT", "stdout,log,csv").split(",")
+            format_strs = os.getenv("OPENAI_LOG_FORMAT", "stdout,log,csv,tensorboard").split(",")
         else:
             format_strs = os.getenv("OPENAI_LOG_FORMAT_MPI", "log").split(",")
     format_strs = filter(None, format_strs)

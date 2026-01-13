@@ -41,7 +41,8 @@ def load_csv_file(filename: str, header_elements=None):
 
 from decimal import Decimal
 from visdom import Visdom
-viz = Visdom(port=8850)
+# viz = Visdom(port=8850)
+viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 
 filename='../BRATS2020_npz/database.csv'
 with open(filename, newline='', encoding='utf-8-sig') as csvfile:

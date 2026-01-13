@@ -5,11 +5,12 @@ from PIL import Image
 import blobfile as bf
 import numpy as np
 import torch as th
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset, Dataset, BatchSampler, RandomSampler, SequentialSampler
 from torchvision import transforms
 from .train_util import visualize
 from visdom import Visdom
-viz = Visdom(port=8850)
+# viz = Visdom(port=8850)
+viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 from scipy import ndimage
 
 
@@ -19,9 +20,13 @@ def load_data(
     batch_size,
     image_size,
     class_cond=False,
-    deterministic=False,
+    deterministic=True,
     random_crop=False,
     random_flip=False,
+    require_charge=False,
+    importance_sampling=False,
+    importance_maxwgt=10,
+    charge_scale=1,
 ):
     """
     For a dataset, create a generator over (images, kwargs) pairs.
@@ -66,7 +71,12 @@ def load_data(
         num_shards=1,
         random_crop=random_crop,
         random_flip=random_flip,
+        importance_sampling=importance_sampling,
+        importance_maxwgt=importance_maxwgt,
+        charge_scale=charge_scale,
+        require_charge=require_charge,
     )
+
     if deterministic:
         loader = DataLoader(
             dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
@@ -75,7 +85,7 @@ def load_data(
         loader = DataLoader(
             dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
         )
-    print('lenloader', len(loader))
+
     while True:
         yield from loader
 
@@ -92,7 +102,7 @@ def _list_image_files_recursively(data_dir):
     return results
 
 
-class ImageDataset(Dataset):
+class ImageDataset(IterableDataset):
     def __init__(
         self,
         resolution,
@@ -100,38 +110,105 @@ class ImageDataset(Dataset):
         classes=None,
         shard=0,
         num_shards=1,
+        importance_sampling=False,
+        importance_maxwgt=10.,
+        charge_scale=1.,
+        require_charge=False,
         random_crop=False,
         random_flip=False,
-        exts=['jpg', 'jpeg', 'png', 'npy']
+        exts=['jpg', 'jpeg', 'png', 'npy', 'npz']
     ):
         super().__init__()
         self.resolution = resolution
         self.local_images = [p for ext in exts for p in Path(f'{image_paths}').glob(f'**/*.{ext}')]
 
-
         self.local_classes = None if classes is None else classes[shard:][::num_shards]
         self.random_crop = random_crop
         self.random_flip = random_flip
 
-    def __len__(self):
-        print('len',  len(self.local_images))
-        return len(self.local_images)
+        self.importance_sampling = importance_sampling
+        self.importance_maxwgt = importance_maxwgt
+        self.charge_scale = charge_scale
+        self.require_charge = require_charge
 
-    def __getitem__(self, idx):
-        path = self.local_images[idx]
-        name=str(path).split("/")[-1].split(".")[0]
-        print('path', name)
+        self.idx = -1
+        self._cache_file = None
+        self._cache_find = -1
+        self._cache_aind = -1
+        self._cache_fname = None
+        self._weights = None
 
+    def _getnext(self):
+        self.idx += 1
+        self._cache_aind += 1
 
-        numpy_img = np.load(path)
-        arr = visualize(numpy_img).astype(np.float32)
+        if self._cache_file is None or self._cache_aind >= self._cache_file.shape[0]:
+            self._cache_find += 1
+            self._cache_aind = 0
 
-        out_dict = {}
-        if self.local_classes is not None:
-            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
-            out_dict["path"]=name
+            if self._cache_find >= len(self.local_images):
+                raise StopIteration 
 
-        return np.transpose(arr, [2, 0, 1]), out_dict
+            path = self.local_images[self._cache_find]
+            name=str(path).split("/")[-1].split(".")[0]
+            numpy_img = np.load(path)
+            self._cache_file = visualize(numpy_img["reco"]).astype(np.float32)
+            self._cache_fname = name
+            self._cache_true = numpy_img["truth"].astype(np.float32)
+
+            # weight by sum of true charge
+            self._weights = np.sum(self._cache_true, axis=(1, 2, 3)).astype(np.float32)
+            # Normalize average weight to 1
+            self._weights = self._weights / np.mean(self._weights)
+
+            # Normalize the charge so that signal and noise pixels are, in total, weighted about the same
+            charge_norm = np.mean(self._cache_true)
+            # per-pixel map of 1 + normalized true charge 
+            self._pixel_weights = 1 + self._cache_true / charge_norm / self.charge_scale
+            # normalized to one
+            self._pixel_weights = self._pixel_weights / np.mean(self._pixel_weights)
+            self._charge = np.sum(self._cache_true, axis=(1, 2, 3)).astype(np.float32)
+
+        arr = self._cache_file[self._cache_aind]
+        w = self._weights[self._cache_aind]
+        pw = self._pixel_weights[self._cache_aind]
+        c = self._charge[self._cache_aind]
+
+        return arr, w, pw, c
+
+    def __iter__(self):
+        while True:
+            while True:
+                try:
+                    arr, w, pw, c = self._getnext()
+                except StopIteration:
+                    print("EPOCH COMPLETED. RESTARTING.")
+                    self._cache_find = 0
+                    continue
+                except Exception as e:
+                    print("Opening file (%s) failed with error: %s. Skipping..." % (self.local_images[self._cache_find], str(e)))
+                    self._cache_find += 1
+                    continue
+
+                # ignore events with no charge
+                if self.require_charge and c < 1:
+                    continue
+                if not self.importance_sampling or (w/self.importance_maxwgt) > np.random.rand():
+                    break
+
+            # If we are importance weighting, then the weight is now 1, so as to not double-count
+            if self.importance_sampling:
+                w[:] = 1.
+
+            out_dict = {}
+            if self.local_classes is not None:
+                out_dict["y"] = np.array(self.local_classes[self._cache_find], dtype=np.int64)
+
+            out_dict["path"] = self._cache_fname
+            out_dict["weight"] = w
+            out_dict["pixel_weight"] = pw
+
+            yield arr, out_dict
 
 
 def center_crop_arr(pil_image, image_size):

@@ -19,9 +19,9 @@ def diffusion_defaults():
         timestep_respacing="",
         use_kl=False,
         predict_xstart=False,
+        predict_xprev=False,
         rescale_timesteps=False,
         rescale_learned_sigmas=False,
-        dataset='brats'
     )
 
 
@@ -90,6 +90,7 @@ def create_model_and_diffusion(
     timestep_respacing,
     use_kl,
     predict_xstart,
+    predict_xprev,
     rescale_timesteps,
     rescale_learned_sigmas,
     use_checkpoint,
@@ -97,7 +98,6 @@ def create_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
-    dataset
 ):
     print('timestepresp1',timestep_respacing )
     model = create_model(
@@ -117,7 +117,6 @@ def create_model_and_diffusion(
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
-        dataset=dataset,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -125,6 +124,7 @@ def create_model_and_diffusion(
         noise_schedule=noise_schedule,
         use_kl=use_kl,
         predict_xstart=predict_xstart,
+        predict_xprev=predict_xprev,
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
@@ -149,7 +149,6 @@ def create_model(
     resblock_updown=False,
     use_fp16=False,
     use_new_attention_order=False,
-    dataset='brats'
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -169,10 +168,7 @@ def create_model(
     for res in attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
         
-    if dataset=='brats':
-      number_in_channels=4
-    else:
-      number_in_channels=1
+    number_in_channels=1 
     print('numberinchannels', number_in_channels)
       
 
@@ -212,6 +208,7 @@ def create_classifier_and_diffusion(
     timestep_respacing,
     use_kl,
     predict_xstart,
+    predict_xprev,
     rescale_timesteps,
     rescale_learned_sigmas,
     dataset,
@@ -234,6 +231,7 @@ def create_classifier_and_diffusion(
         noise_schedule=noise_schedule,
         use_kl=use_kl,
         predict_xstart=predict_xstart,
+        predict_xprev=predict_xprev,
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
@@ -315,6 +313,7 @@ def sr_create_model_and_diffusion(
     timestep_respacing,
     use_kl,
     predict_xstart,
+    predict_xprev,
     rescale_timesteps,
     rescale_learned_sigmas,
     use_checkpoint,
@@ -346,6 +345,7 @@ def sr_create_model_and_diffusion(
         noise_schedule=noise_schedule,
         use_kl=use_kl,
         predict_xstart=predict_xstart,
+        predict_xprev=predict_xprev,
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
@@ -374,6 +374,7 @@ def sr_create_model(
 
     if large_size == 512:
         channel_mult = (1, 1, 2, 2, 4, 4)
+        # channel_mult = (1, 2, 4, 8, 16, 16)
     elif large_size == 256:
         channel_mult = (1, 1, 2, 2, 4, 4)
     elif large_size == 64:
@@ -413,6 +414,7 @@ def create_gaussian_diffusion(
     noise_schedule="linear",
     use_kl=False,
     predict_xstart=False,
+    predict_xprev=False,
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
@@ -427,12 +429,18 @@ def create_gaussian_diffusion(
     if not timestep_respacing:
         timestep_respacing = [steps]
     print('steps', steps, timestep_respacing)
+    print("predict_xstart", predict_xstart)
+    print("predict_xprev", predict_xprev)
+    model_mean_type = gd.ModelMeanType.EPSILON
+    if predict_xprev:
+        model_mean_type = gd.ModelMeanType.PREVIOUS_X
+    elif predict_xstart:
+        model_mean_type = gd.ModelMeanType.START_X
+    print("model_mean_type", model_mean_type)
     return SpacedDiffusion(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
-        model_mean_type=(
-            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
-        ),
+        model_mean_type=model_mean_type,
         model_var_type=(
             (
                 gd.ModelVarType.FIXED_LARGE

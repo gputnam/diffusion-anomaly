@@ -12,7 +12,8 @@ from torchvision.utils import save_image
 import torch
 import math
 from visdom import Visdom
-viz = Visdom(port=8850)
+# viz = Visdom(port=8850)
+viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 import numpy as np
 import torch as th
 from .train_util import visualize
@@ -659,7 +660,6 @@ class GaussianDiffusion:
             img = th.randn(*shape, device=device)
       
         indices = list(range(time))[::-1]
-        print('indices', indices)
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
@@ -684,15 +684,6 @@ class GaussianDiffusion:
                     )
                     yield out
                     img = out["sample"]
-
-                    if i%100==0:
-                     print('i', i)
-                     viz.image(visualize(img[0,0,...]), opts=dict(caption=str(i)))
-                     viz.image(visualize(img[0, 1,...]), opts=dict(caption=str(i)))
-                     viz.image(visualize(img[0, 2,...]), opts=dict(caption=str(i)))
-                     viz.image(visualize(img[0, 3,...]), opts=dict(caption=str(i)))
-                     viz.image(visualize(out["saliency"][0,0,...]), opts=dict(caption='saliency'))
-              
 
     def ddim_sample(
             self,
@@ -742,7 +733,10 @@ class GaussianDiffusion:
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"], "saliency": saliency }
+        ret = {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        if cond_fn is not None:
+            ret["saliency"] = saliency
+        return ret
 
 
     def ddim_reverse_sample(
@@ -933,6 +927,7 @@ class GaussianDiffusion:
         shape,
         time=1000,
         noise=None,
+        reverse=False,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -954,8 +949,7 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(time-1))[::-1]
-        print('indices', indices)
+        indices = list(range(time))[::-1] if not reverse else list(range(1, time))
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
@@ -964,15 +958,12 @@ class GaussianDiffusion:
             indices = tqdm(indices)
 
         for i in indices:
-
-            k=abs(time-1-i)
-            if k%20==0:
-                print('k',k)
-
-            t = th.tensor([k] * shape[0], device=device)
+            t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
 
-                out = self.ddim_reverse_sample(
+                f = self.ddim_reverse_sample if reverse else self.ddim_sample
+
+                out = f(
                     model,
                     img,
                     t,
@@ -984,24 +975,6 @@ class GaussianDiffusion:
 
                 yield out
                 img = out["sample"]
-
-        viz.image(visualize(img.cpu()[0,0, ...]), opts=dict(caption="reversesample"))
-        for i in indices:
-                t = th.tensor([i] * shape[0], device=device)
-                with th.no_grad():
-                 out = self.ddim_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
-                    model_kwargs=model_kwargs,
-                    eta=eta,
-                 )
-                yield out
-                img = out["sample"]
-                saliency=out['saliency']
 
     def _vb_terms_bpd(
         self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
@@ -1040,7 +1013,7 @@ class GaussianDiffusion:
 
 
    # def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
-    def training_losses(self, model,  x_start, t, classifier=None, model_kwargs=None, noise=None):
+    def training_losses(self, model,  x_start, t, classifier=None, model_kwargs=None, noise=None, pixel_wgt=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -1104,7 +1077,11 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            err = (target - model_output) ** 2
+            if pixel_wgt is not None: 
+                err = err * pixel_wgt
+
+            terms["mse"] = mean_flat(err)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
@@ -1112,7 +1089,7 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
 
-        return (terms, model_output)
+        return (terms, target, model_output)
 
 
   
@@ -1169,7 +1146,7 @@ class GaussianDiffusion:
 
             # Calculate VLB term at the current timestep
             with th.no_grad():
-                out = self._vb_terms_bptimestepsd(
+                out = self._vb_terms_bpd(
                     model,
                     x_start=x_start,
                     x_t=x_t,
