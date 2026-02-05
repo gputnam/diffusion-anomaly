@@ -19,7 +19,7 @@ from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from visdom import Visdom
 import numpy as np
-viz = Visdom(port=8850)
+viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 loss_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='classification loss'))
 val_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='validation loss'))
 acc_window= viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='acc', title='accuracy'))
@@ -78,24 +78,13 @@ def main():
 
     logger.log("creating data loader...")
 
-    if args.dataset == 'brats':
-        ds = BRATSDataset(args.data_dir, test_flag=False)
-        datal = th.utils.data.DataLoader(
-            ds,
-            batch_size=args.batch_size,
-            shuffle=True)
-        data = iter(datal)
-
-    elif args.dataset == 'chexpert':
-        data = load_data(
+    # TODO: make shuffle work
+    datal = load_data(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
             image_size=args.image_size,
-            class_cond=True,
-        )
-        print('dataset is chexpert')
-
-
+            class_cond=True, 
+    )
 
     logger.log(f"creating optimizer...")
     opt = AdamW(mp_trainer.master_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -112,18 +101,12 @@ def main():
 
 
     def forward_backward_log(data_loader, step, prefix="train"):
-        if args.dataset=='brats':
-            batch, extra, labels,_ , _ = next(data_loader)
-            print('IS BRATS')
-
-        elif  args.dataset=='chexpert':
-            batch, extra = next(data_loader)
-            labels = extra["y"].to(dist_util.dev())
-            print('IS CHEXPERT')
-
+        batch, extra = next(datal)
+        labels = extra["y"].to(dist_util.dev())
         print('labels', labels)
         batch = batch.to(dist_util.dev())
         labels= labels.to(dist_util.dev())
+        print("DEBUG: Found {} batches in the loader".format(len(batch)))
         if args.noised:
             t, _ = schedule_sampler.sample(batch.shape[0], dist_util.dev())
             batch = diffusion.q_sample(batch, t)
@@ -187,11 +170,8 @@ def main():
         if args.anneal_lr:
             set_annealed_lr(opt, args.lr, (step + resume_step) / args.iterations)
         print('step', step + resume_step)
-        try:
-            losses = forward_backward_log(data, step + resume_step)
-        except:
-            data = iter(datal)
-            losses = forward_backward_log(data, step + resume_step)
+
+        losses = forward_backward_log(iter(datal), step + resume_step)
 
         correct+=losses["train_acc@1"].sum()
         total+=args.batch_size

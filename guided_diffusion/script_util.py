@@ -250,7 +250,9 @@ def create_classifier(
     classifier_pool,
     dataset,
 ):
-    if image_size == 256:
+    if image_size == 512:
+        channel_mult = (1, 1, 2, 2, 4, 4)
+    elif image_size == 256:
         channel_mult = (1, 1, 2, 2, 4, 4)
     elif image_size == 128:
         channel_mult = (1, 1, 2, 3, 4)
@@ -262,10 +264,7 @@ def create_classifier(
     attention_ds = []
     for res in classifier_attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
-    if dataset=='brats':
-      number_in_channels=4
-    else:
-      number_in_channels=1
+    number_in_channels=1 
     print('number_in_channels classifier', number_in_channels)
       
 

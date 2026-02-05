@@ -56,7 +56,7 @@ def load_data(
         # Assume classes are the first part of the filename,
         # before an underscore.
 
-        class_names =[path.split("/")[3] for path in all_files] #9 or 3
+        class_names =[path.split("/")[6] for path in all_files] #9 or 3
         print('classnames', class_names)
 
 
@@ -95,7 +95,7 @@ def _list_image_files_recursively(data_dir):
     for entry in sorted(bf.listdir(data_dir)):
         full_path = bf.join(data_dir, entry)
         ext = entry.split(".")[-1]
-        if "." in entry and ext.lower() in ["jpg", "jpeg", "png", "gif", "npy"]:
+        if "." in entry and ext.lower() in ["jpg", "jpeg", "png", "gif", "npy", "npz"]:
             results.append(full_path)
         elif bf.isdir(full_path):
             results.extend(_list_image_files_recursively(full_path))
@@ -174,7 +174,7 @@ class ImageDataset(IterableDataset):
         pw = self._pixel_weights[self._cache_aind]
         c = self._charge[self._cache_aind]
 
-        return arr, w, pw, c
+        return arr, w, pw, c 
 
     def __iter__(self):
         while True:
@@ -209,6 +209,41 @@ class ImageDataset(IterableDataset):
             out_dict["pixel_weight"] = pw
 
             yield arr, out_dict
+
+
+class ShuffleDataset(IterableDataset):
+    def __init__(self, dataset, buffer_size=1000):
+        super().__init__()
+        self.dataset = dataset
+        self.buffer_size = buffer_size
+        self._iterator = None  # To store the state
+
+    def __iter__(self):
+        # This creates a generator, which IS an iterator
+        shufbuf = []
+        try:
+            dataset_iter = iter(self.dataset)
+            for _ in range(self.buffer_size):
+                shufbuf.append(next(dataset_iter))
+        except StopIteration:
+            pass
+
+        try:
+            while True:
+                item = next(dataset_iter)
+                idx = random.randint(0, len(shufbuf) - 1)
+                yield shufbuf[idx]
+                shufbuf[idx] = item
+        except StopIteration:
+            random.shuffle(shufbuf)
+            for item in shufbuf:
+                yield item
+
+    # Adding this often resolves 'is not an iterator' in complex loaders
+    def __next__(self):
+        if self._iterator is None:
+            self._iterator = iter(self)
+        return next(self._iterator)
 
 
 def center_crop_arr(pil_image, image_size):
