@@ -4,6 +4,7 @@ Train a noised image classifier on ImageNet.
 
 import argparse
 import os
+import random
 import sys
 from torch.autograd import Variable
 sys.path.append("..")
@@ -16,17 +17,17 @@ os.environ['OMP_NUM_THREADS'] = '8'
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
-from torch.optim import AdamW
-from visdom import Visdom
+from torch.optim import Adam, AdamW
+#from visdom import Visdom
 import numpy as np
-viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
-loss_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='classification loss'))
-val_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='validation loss'))
-acc_window= viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='acc', title='accuracy'))
+#viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
+#loss_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='classification loss'))
+#val_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='validation loss'))
+#acc_window= viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='acc', title='accuracy'))
 
 from guided_diffusion import dist_util, logger
 from guided_diffusion.fp16_util import MixedPrecisionTrainer
-from guided_diffusion.image_datasets import load_data
+from guided_diffusion.image_datasets import load_data, ShuffleDataset
 from guided_diffusion.train_util import visualize
 from guided_diffusion.resample import create_named_schedule_sampler
 from guided_diffusion.script_util import (
@@ -37,18 +38,21 @@ from guided_diffusion.script_util import (
 )
 from guided_diffusion.train_util import parse_resume_step_from_filename, log_loss_dict
 
+from matplotlib import pyplot as plt
+
 
 
 def main():
     args = create_argparser().parse_args()
 
     dist_util.setup_dist()
-    logger.configure()
+    logger.configure(log_suffix="classifier_wdataloader")
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_classifier_and_diffusion(
         **args_to_dict(args, classifier_and_diffusion_defaults().keys()),
     )
+    print("======DEUG: args.noised", args.noised)
     model.to(dist_util.dev())
     if args.noised:
         schedule_sampler = create_named_schedule_sampler(
@@ -78,16 +82,18 @@ def main():
 
     logger.log("creating data loader...")
 
-    # TODO: make shuffle work
     datal = load_data(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
             image_size=args.image_size,
+            charge_scale=args.charge_scale,
             class_cond=True, 
     )
+    #datal = ShuffleDataset(datal, buffer_size=1000)
 
     logger.log(f"creating optimizer...")
-    opt = AdamW(mp_trainer.master_params, lr=args.lr, weight_decay=args.weight_decay)
+    #opt = AdamW(mp_trainer.master_params, lr=args.lr, weight_decay=args.weight_decay)
+    opt = Adam(mp_trainer.master_params, lr=args.lr, weight_decay=args.weight_decay)
     if args.resume_checkpoint:
         opt_checkpoint = bf.join(
             bf.dirname(args.resume_checkpoint), f"opt{resume_step:06}.pt"
@@ -101,12 +107,81 @@ def main():
 
 
     def forward_backward_log(data_loader, step, prefix="train"):
-        batch, extra = next(datal)
-        labels = extra["y"].to(dist_util.dev())
+        # loading data
+        batch = []
+        labels = []
+        batch_val = []
+        labels_val = []
+
+        base_path = "/scratch/7DayLifetime/munjung/anomaly-detection/npz"
+        classdirs = os.listdir(base_path)
+        classdirs = ["/scratch/7DayLifetime/gputnam/raw-sq-wtruth",  "/scratch/7DayLifetime/munjung/anomaly-detection/npz/erase"]
+        class_idxs = []
+        for cidx, c in enumerate(classdirs):
+
+            # randomly choose 
+            classfiles = os.listdir(c)[:20]
+            classfiles = [os.path.join(c, f) for f in classfiles]
+            classfiles = np.random.choice(classfiles, size=2, replace=False)
+
+            # DEBUG: try on the same files
+            #if cidx == 0:
+            #    classfiles = ["/scratch/7DayLifetime/gputnam/raw-sq-wtruth/tpc0_plane1_rec_82090893_270.npz"]
+
+            #elif cidx == 1:
+            #    classfiles = ["/scratch/7DayLifetime/munjung/anomaly-detection/npz/erase/tpc0_plane0_rec_67583145_18_diseased_erase.npz"]
+            print('classfiles', classfiles)
+
+            for file in classfiles:
+                numpy_img = np.load(file)
+                _cache_file = visualize(numpy_img["reco"]).astype(np.float32)
+                _cache_true = numpy_img["truth"].astype(np.float32)
+        
+                _weights = np.sum(_cache_true, axis=(1, 2, 3)).astype(np.float32)
+                _weights = _weights / np.mean(_weights)
+        
+                charge_norm = np.mean(_cache_true)
+                _pixel_weights = 1 + _cache_true / charge_norm # / charge_scale
+                _pixel_weights = _pixel_weights / np.mean(_pixel_weights)
+                _charge = np.sum(_cache_true, axis=(1, 2, 3)).astype(np.float32)
+        
+                #for iidx in range(3):
+                iidxs = np.random.choice(_cache_file.shape[0], size=50, replace=False)
+                #iidxs = np.arange(_cache_file.shape[0])[:30]
+                n_train = 0
+                for iidx in iidxs[:30]:
+                    arr = _cache_file[iidx]
+                    w = _weights[iidx]
+                    pw = _pixel_weights[iidx]
+                    c = _charge[iidx]
+
+                    if np.max(arr) < 0.5:
+                        continue
+
+                    batch.append([arr])
+                    labels.append(cidx)
+                    n_train += 1
+                    if n_train >= 10:
+                        break
+
+
+        # shuffle
+        shuffler = np.random.permutation(len(labels))
+        labels = np.array(labels)[shuffler] 
+        batch = np.concatenate(batch)[shuffler]
+        print("batchh shape", batch.shape)
+        # transpose first and second dimension to match the input shape of the model
+        print("batch shape before transpose", batch.shape)
+        #batch = np.transpose(batch, (1, 0, 2, 3))
+        print("labels", labels)
+        batch = th.from_numpy(batch).to(dist_util.dev())
+        labels = th.from_numpy(labels).to(dist_util.dev()).long()
+
+        #batch, extra = next(data_loader)
+        #labels = extra["y"].to(dist_util.dev())
+        #batch = batch.to(dist_util.dev())
+        #labels= labels.to(dist_util.dev())
         print('labels', labels)
-        batch = batch.to(dist_util.dev())
-        labels= labels.to(dist_util.dev())
-        print("DEBUG: Found {} batches in the loader".format(len(batch)))
         if args.noised:
             t, _ = schedule_sampler.sample(batch.shape[0], dist_util.dev())
             batch = diffusion.q_sample(batch, t)
@@ -119,6 +194,7 @@ def main():
           
             sub_batch = Variable(sub_batch, requires_grad=True)
             logits = model(sub_batch, timesteps=sub_t)
+            print("=====DEBUG: logits: ", logits)
          
             loss = F.cross_entropy(logits, sub_labels, reduction="none")
             losses = {}
@@ -129,28 +205,30 @@ def main():
             losses[f"{prefix}_acc@2"] = compute_top_k(
                 logits, sub_labels, k=2, reduction="none"
             )
+            print('loss', losses[f"{prefix}_loss"])
             print('acc', losses[f"{prefix}_acc@1"])
             log_loss_dict(diffusion, sub_t, losses)
 
-            loss = loss.mean()
+            loss = loss.mean() #* 10
             if prefix=="train":
-                viz.line(X=th.ones((1, 1)).cpu() * step, Y=th.Tensor([loss]).unsqueeze(0).cpu(),
-                     win=loss_window, name='loss_cls',
-                     update='append')
+                print("hi")
+                #viz.line(X=th.ones((1, 1)).cpu() * step, Y=th.Tensor([loss]).unsqueeze(0).cpu(),
+                #     win=loss_window, name='loss_cls',
+                #     update='append')
 
             else:
 
-                output_idx = logits[0].argmax()
-                print('outputidx', output_idx)
-                output_max = logits[0, output_idx]
-                print('outmax', output_max, output_max.shape)
-                output_max.backward()
-                saliency, _ = th.max(sub_batch.grad.data.abs(), dim=1)
-                print('saliency', saliency.shape)
-                viz.heatmap(visualize(saliency[0, ...]))
-                viz.image(visualize(sub_batch[0, 0,...]))
-                viz.image(visualize(sub_batch[0, 1, ...]))
-                th.cuda.empty_cache()
+               output_idx = logits[0].argmax()
+               print('outputidx', output_idx)
+               output_max = logits[0, output_idx]
+               print('outmax', output_max, output_max.shape)
+               output_max.backward()
+               saliency, _ = th.max(sub_batch.grad.data.abs(), dim=1)
+               print('saliency', saliency.shape)
+               #viz.heatmap(visualize(saliency[0, ...]))
+               #viz.image(visualize(sub_batch[0, 0,...]))
+               #viz.image(visualize(sub_batch[0, 1, ...]))
+               th.cuda.empty_cache()
 
 
             if loss.requires_grad and prefix=="train":
@@ -171,13 +249,22 @@ def main():
             set_annealed_lr(opt, args.lr, (step + resume_step) / args.iterations)
         print('step', step + resume_step)
 
-        losses = forward_backward_log(iter(datal), step + resume_step)
+        losses = forward_backward_log(datal, step + resume_step)
 
         correct+=losses["train_acc@1"].sum()
         total+=args.batch_size
         acctrain=correct/total
 
+        # see if the weights are being updated
+        old_weights = model.parameters().__next__().clone()
+
         mp_trainer.optimize(opt)
+
+        # After the optimization step
+        new_weights = model.parameters().__next__()
+        diff = th.abs(new_weights - old_weights).sum().item()
+        
+        print(f"=====DEBUG: Total weight change: {diff}")
           
         if not step % args.log_interval:
             logger.dumpkvs()
@@ -205,9 +292,9 @@ def save_model(mp_trainer, opt, step):
     if dist.get_rank() == 0:
         th.save(
             mp_trainer.master_params_to_state_dict(mp_trainer.master_params),
-            os.path.join(logger.get_dir(), f"modelbratsclass{step:06d}.pt"),
+            os.path.join(logger.get_dir(), f"classifier_model_{step:06d}.pt"),
         )
-        th.save(opt.state_dict(), os.path.join(logger.get_dir(), f"optbratsclass{step:06d}.pt"))
+        th.save(opt.state_dict(), os.path.join(logger.get_dir(), f"classifier_opt_{step:06d}.pt"))
 
 def compute_top_k(logits, labels, k, reduction="mean"):
     _, top_ks = th.topk(logits, k, dim=-1)
@@ -230,7 +317,7 @@ def create_argparser():
     defaults = dict(
         data_dir="",
         val_data_dir="",
-        noised=True,
+        noised=False,
         iterations=150000,
         lr=3e-4,
         weight_decay=0.0,
@@ -241,8 +328,9 @@ def create_argparser():
         resume_checkpoint="",
         log_interval=1,
         eval_interval=1000,
-        save_interval=5000,
-        dataset='brats'
+        save_interval=500,
+        dataset='brats',
+        charge_scale=False
     )
     defaults.update(classifier_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
