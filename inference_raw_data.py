@@ -82,7 +82,6 @@ def validation_plots_wclass(
     model_kwargs = {}
     cond_fn = None
     if classifier is not None:
-        model_kwargs["y"] = th.tensor([target_class], device=dist_util.dev(), dtype=th.long)
 
         def cond_fn(x, t, y=None):
             assert y is not None
@@ -106,22 +105,25 @@ def validation_plots_wclass(
 
         t = th.tensor(t - 1, device=dist_util.dev())
 
-        # gaussian noise
-        # idiff = diffusion.q_sample(img0, t)
+        if ddpm:
+            # gaussian noise
+            idiff = diffusion.q_sample(img0, t)
 
-        # ddim noise
-        idiff = diffusion.ddim_sample_loop_progressive(
-            model, 
-            img0.shape, 
-            time=t.item(), 
-            noise=img0.unsqueeze(0), 
-            cond_fn=cond_fn,
-            model_kwargs=model_kwargs)
+        else:
+            # ddim noise
+            idiff = diffusion.ddim_sample_loop_progressive(
+                model, 
+                img0.shape, 
+                time=t.item(), 
+                noise=img0.unsqueeze(0), 
+                reverse=True,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs)
 
-        final = None
-        for g in idiff:
-            final = g
-        idiff = final["sample"].squeeze(0)
+            final = None
+            for g in idiff:
+                final = g
+            idiff = final["sample"].squeeze(0)
 
         idiffs.append(idiff)
         ts.append(t)
@@ -222,15 +224,13 @@ if __name__ == "__main__":
 
     # save configs
     if threshold > 0.0:
-        save_dir = input_base_dir + f"/results_interesting-grayNN-{runargs.noise_type}"
+        save_dir = input_base_dir + f"/results_interesting-grayNN-{threshold}-{runargs.noise_type}"
         print("saveing frames with interesting images")
     else:
-        save_dir = input_base_dir + f"/results-grayNN-{runargs.noise_type}"
+        save_dir = input_base_dir + f"/results-grayNN-{threshold}-{runargs.noise_type}"
         print("saveing frames with all images")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-
-    save_name_tag = "SBND_raw_data"
 
     for filename in filenames:
         save_data = {}
