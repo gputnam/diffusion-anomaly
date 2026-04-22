@@ -3,6 +3,7 @@ import inspect
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
+from .anisotropic_diffusion import SpacedAnisotropicDiffusion
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
 NUM_CLASSES = 2
@@ -22,6 +23,14 @@ def diffusion_defaults():
         predict_xprev=False,
         rescale_timesteps=False,
         rescale_learned_sigmas=False,
+        # Anisotropic noise (DiffSSC-style local noise offsets).
+        # Set anisotropic_noise=True to use SpacedAnisotropicDiffusion.
+        anisotropic_noise=False,
+        noise_mode="signal_proportional",   # binary_mask | signal_proportional | local_std
+        empty_noise_fraction=0.05,
+        smoothing_sigma=2.0,
+        occupancy_threshold=0.01,
+        local_std_patch_size=8,
     )
 
 
@@ -98,6 +107,12 @@ def create_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
+    anisotropic_noise=False,
+    noise_mode="signal_proportional",
+    empty_noise_fraction=0.05,
+    smoothing_sigma=2.0,
+    occupancy_threshold=0.01,
+    local_std_patch_size=8,
 ):
     print('timestepresp1',timestep_respacing )
     model = create_model(
@@ -128,6 +143,12 @@ def create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        anisotropic_noise=anisotropic_noise,
+        noise_mode=noise_mode,
+        empty_noise_fraction=empty_noise_fraction,
+        smoothing_sigma=smoothing_sigma,
+        occupancy_threshold=occupancy_threshold,
+        local_std_patch_size=local_std_patch_size,
     )
     return model, diffusion
 
@@ -417,6 +438,12 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
+    anisotropic_noise=False,
+    noise_mode="signal_proportional",
+    empty_noise_fraction=0.05,
+    smoothing_sigma=2.0,
+    occupancy_threshold=0.01,
+    local_std_patch_size=8,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
@@ -436,7 +463,8 @@ def create_gaussian_diffusion(
     elif predict_xstart:
         model_mean_type = gd.ModelMeanType.START_X
     print("model_mean_type", model_mean_type)
-    return SpacedDiffusion(
+
+    common_kwargs = dict(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
         model_mean_type=model_mean_type,
@@ -452,6 +480,17 @@ def create_gaussian_diffusion(
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
     )
+
+    if anisotropic_noise:
+        return SpacedAnisotropicDiffusion(
+            **common_kwargs,
+            noise_mode=noise_mode,
+            empty_noise_fraction=empty_noise_fraction,
+            smoothing_sigma=smoothing_sigma,
+            occupancy_threshold=occupancy_threshold,
+            local_std_patch_size=local_std_patch_size,
+        )
+    return SpacedDiffusion(**common_kwargs)
 
 
 def add_dict_to_argparser(parser, default_dict):

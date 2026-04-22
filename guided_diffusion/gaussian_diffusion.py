@@ -54,11 +54,50 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
         return np.linspace(
             beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
         )
+    elif schedule_name == "quadratic":
+        t = np.linspace(0, num_diffusion_timesteps, num_diffusion_timesteps)
+        beta_1 = 1e-4
+        beta_T = 0.02
+        return beta_1 + (t/num_diffusion_timesteps)**2 * (beta_T - beta_1)
     elif schedule_name == "cosine":
         return betas_for_alpha_bar(
             num_diffusion_timesteps,
             lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
         )
+    elif schedule_name == "hyperbolic":
+        return np.clip(betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: 1.0 - t,
+        ), a_min=None, a_max=0.999)
+    elif schedule_name == "time_dependent":
+        scale = 1000 / num_diffusion_timesteps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        timing = np.linspace(0, 1, num_diffusion_timesteps, dtype=np.float64)
+        return beta_start * (beta_end / beta_start) ** timing
+    elif schedule_name == "ramp":
+        scale = 1000 / num_diffusion_timesteps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        T = num_diffusion_timesteps
+        n = 10  # segment half-length (paper uses n=10)
+        segment_len = 2 * n
+        betas = np.empty(T, dtype=np.float64)
+        # build the linear ramp for one segment
+        linear_part = np.linspace(beta_start, beta_end, T, dtype=np.float64)
+        for k in range(T // segment_len):
+            start_idx = k * segment_len
+            # constant part: repeat the first value of this segment's linear section
+            const_val = linear_part[start_idx]
+            betas[start_idx:start_idx + n] = const_val
+            # linear part: use the actual linear ramp values
+            betas[start_idx + n:start_idx + segment_len] = linear_part[start_idx + n:start_idx + segment_len]
+        # handle any remainder
+        remaining = T % segment_len
+        if remaining > 0:
+            start_idx = T - remaining
+            betas[start_idx:] = linear_part[start_idx:]
+        return betas
     else:
         raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
 
