@@ -4,6 +4,7 @@ from pathlib import Path
 from PIL import Image
 import blobfile as bf
 import numpy as np
+import h5py
 import torch as th
 from torch.utils.data import DataLoader, IterableDataset, Dataset, BatchSampler, RandomSampler, SequentialSampler
 from torchvision import transforms
@@ -113,7 +114,7 @@ class ImageDataset(IterableDataset):
         require_charge=False,
         random_crop=False,
         random_flip=False,
-        exts=['jpg', 'jpeg', 'png', 'npy', 'npz']
+        exts=['jpg', 'jpeg', 'png', 'npy', 'npz', 'h5']
     ):
         super().__init__()
         self.resolution = resolution
@@ -148,10 +149,36 @@ class ImageDataset(IterableDataset):
 
             path = self.local_images[self._cache_find]
             name=str(path).split("/")[-1].split(".")[0]
-            numpy_img = np.load(path)
-            self._cache_file = visualize(numpy_img["reco"]).astype(np.float32)
             self._cache_fname = name
-            self._cache_true = numpy_img["truth"].astype(np.float32)
+
+            if str(path).endswith(".npz"):
+                numpy_img = np.load(path)
+                self._cache_file = visualize(numpy_img["reco"]).astype(np.float32)
+                self._cache_true = numpy_img["truth"].astype(np.float32)
+            elif str(path).endswith(".h5"):
+                with h5py.File(str(path), "r") as f:
+                    # scale charge by value
+                    arrs = [f[ev]["raw"][:] for ev in f.keys()]
+                allarrs = []
+                for arr in arrs:
+                    nrows, ncols = (512, 512)
+                    plane_boundaries = [0, 1984, 3968, 5638]
+                    for planeno, (wlo, whi) in enumerate(zip(plane_boundaries[:-1], plane_boundaries[1:])):
+                        cscale = [200., 100., 200.][planeno]
+                        
+                        planearr = arr[wlo:whi, :]/cscale
+                        h, w = planearr.shape
+                        ll = planearr[:(h//nrows)*nrows, :(w//nrows)*nrows].reshape(h//nrows, nrows, -1, ncols).swapaxes(1,2).reshape(-1, nrows, ncols)
+                        allarrs.append(ll)
+                        
+                self._cache_file = visualize(np.expand_dims(np.concatenate(allarrs), axis=1)).astype(np.float32)
+                # dummy charge, for now
+                self._cache_true = np.ones((self._cache_file.shape[0], 1, nrows, ncols)).astype(np.float32)
+                
+            else: 
+                assert(False)
+                    
+
 
             # weight by sum of true charge
             self._weights = np.sum(self._cache_true, axis=(1, 2, 3)).astype(np.float32)
