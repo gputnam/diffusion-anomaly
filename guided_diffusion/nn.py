@@ -18,6 +18,9 @@ class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
 
+class GroupNorm16(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
 
 def conv_nd(dims, *args, **kwargs):
     """
@@ -97,6 +100,7 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
+    # return GroupNorm16(16, channels)
     return GroupNorm32(32, channels)
 
 
