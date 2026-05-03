@@ -9,7 +9,6 @@ import sys
 from torch.autograd import Variable
 sys.path.append("..")
 sys.path.append(".")
-from guided_diffusion.bratsloader import BRATSDataset
 import blobfile as bf
 import torch as th
 os.environ['OMP_NUM_THREADS'] = '8'
@@ -18,12 +17,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import Adam, AdamW
-#from visdom import Visdom
 import numpy as np
-#viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
-#loss_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='classification loss'))
-#val_window = viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='Loss', title='validation loss'))
-#acc_window= viz.line( Y=th.zeros((1)).cpu(), X=th.zeros((1)).cpu(), opts=dict(xlabel='epoch', ylabel='acc', title='accuracy'))
 
 from guided_diffusion import dist_util, logger
 from guided_diffusion.fp16_util import MixedPrecisionTrainer
@@ -209,26 +203,16 @@ def main():
             print('acc', losses[f"{prefix}_acc@1"])
             log_loss_dict(diffusion, sub_t, losses)
 
-            loss = loss.mean() #* 10
-            if prefix=="train":
-                print("hi")
-                #viz.line(X=th.ones((1, 1)).cpu() * step, Y=th.Tensor([loss]).unsqueeze(0).cpu(),
-                #     win=loss_window, name='loss_cls',
-                #     update='append')
-
-            else:
-
-               output_idx = logits[0].argmax()
-               print('outputidx', output_idx)
-               output_max = logits[0, output_idx]
-               print('outmax', output_max, output_max.shape)
-               output_max.backward()
-               saliency, _ = th.max(sub_batch.grad.data.abs(), dim=1)
-               print('saliency', saliency.shape)
-               #viz.heatmap(visualize(saliency[0, ...]))
-               #viz.image(visualize(sub_batch[0, 0,...]))
-               #viz.image(visualize(sub_batch[0, 1, ...]))
-               th.cuda.empty_cache()
+            loss = loss.mean()
+            if prefix != "train":
+                output_idx = logits[0].argmax()
+                print('outputidx', output_idx)
+                output_max = logits[0, output_idx]
+                print('outmax', output_max, output_max.shape)
+                output_max.backward()
+                saliency, _ = th.max(sub_batch.grad.data.abs(), dim=1)
+                print('saliency', saliency.shape)
+                th.cuda.empty_cache()
 
 
             if loss.requires_grad and prefix=="train":
@@ -329,7 +313,6 @@ def create_argparser():
         log_interval=1,
         eval_interval=1000,
         save_interval=500,
-        dataset='brats',
         charge_scale=False
     )
     defaults.update(classifier_and_diffusion_defaults())

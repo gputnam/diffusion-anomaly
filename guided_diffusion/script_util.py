@@ -47,7 +47,6 @@ def classifier_defaults():
         classifier_use_scale_shift_norm=True,  # False
         classifier_resblock_updown=True,  # False
         classifier_pool="spatial",
-        dataset='brats'
     )
 
 
@@ -232,7 +231,6 @@ def create_classifier_and_diffusion(
     predict_xprev,
     rescale_timesteps,
     rescale_learned_sigmas,
-    dataset,
 ):
     print('timestepresp2', timestep_respacing)
     classifier = create_classifier(
@@ -244,7 +242,6 @@ def create_classifier_and_diffusion(
         classifier_use_scale_shift_norm,
         classifier_resblock_updown,
         classifier_pool,
-        dataset,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -269,7 +266,6 @@ def create_classifier(
     classifier_use_scale_shift_norm,
     classifier_resblock_updown,
     classifier_pool,
-    dataset,
 ):
     if image_size == 512:
         channel_mult = (1, 1, 2, 2, 4, 4)

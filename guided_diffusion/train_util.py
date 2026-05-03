@@ -12,10 +12,7 @@ from . import dist_util, logger, validation_plots
 from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-from visdom import Visdom
 from tqdm.auto import tqdm
-# viz = Visdom(port=8850)
-viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 import numpy as np
 
 INITIAL_LOG_LOSS_SCALE = 20.0
@@ -320,9 +317,9 @@ class TrainLoop:
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
-                    filename = f"brats2update{(self.step+self.resume_step):06d}.pt"
+                    filename = f"model{(self.step+self.resume_step):06d}.pt"
                 else:
-                    filename = f"emabrats2update_{rate}_{(self.step+self.resume_step):06d}.pt"
+                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
                 print('filename', filename)
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
@@ -333,7 +330,7 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"optbrats2update{(self.step+self.resume_step):06d}.pt"),
+                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)

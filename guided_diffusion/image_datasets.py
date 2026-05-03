@@ -8,9 +8,6 @@ import torch as th
 from torch.utils.data import DataLoader, IterableDataset, Dataset, BatchSampler, RandomSampler, SequentialSampler
 from torchvision import transforms
 from .train_util import visualize
-from visdom import Visdom
-# viz = Visdom(port=8850)
-viz = Visdom(port=8850, server="sbndbuild03.fnal.gov")
 from scipy import ndimage
 
 
