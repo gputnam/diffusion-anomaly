@@ -215,7 +215,8 @@ class ImageDataset(IterableDataset):
                     continue
 
                 # ignore events with no charge
-                if self.require_charge and c < 1:
+                # if self.require_charge and c < 1:
+                if self.require_charge and np.max(np.abs(arr)) < 0.2:
                     continue
                 if not self.importance_sampling or (w/self.importance_maxwgt) > np.random.rand():
                     break
