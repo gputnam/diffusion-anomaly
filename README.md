@@ -1,58 +1,87 @@
-# Diffusion Models for Medical Anomaly Detection
+# Diffusion Models for LArTPC Anomaly Detection (SBND / ICARUS)
 
-We provide the Pytorch implementation of our MICCAI 2022 submission "Diffusion Models for Medical Anomaly Detection" (paper 704).
+Anomaly detection on Liquid Argon Time Projection Chamber (LArTPC) detector
+images from the SBND and ICARUS experiments at Fermilab. A denoising
+diffusion probabilistic model (DDPM) is trained on nominal reconstructions;
+classifier-guided sampling translates anomalous events toward the nominal
+manifold; the per-pixel difference between the input and the reconstruction
+is the anomaly map.
 
+Forked from
+[openai/guided-diffusion](https://github.com/openai/guided-diffusion) via
+the MICCAI 2022 medical-imaging adaptation.
 
-The implementation of Denoising Diffusion Probabilistic Models presented in the paper is based on [openai/guided-diffusion](https://github.com/openai/guided-diffusion).
+## Data format
 
+The dataset loader (`guided_diffusion/image_datasets.py`) reads:
 
-## Data
+- **`.npz`** files with two arrays:
+  - `reco` — reconstructed detector image, shape `(N, 1, H, W)`.
+  - `truth` — true charge per pixel, same shape; used for importance
+    sampling and pixel weighting.
+- **`.h5`** files with raw waveform planes; charge is normalized per
+  plane and tiled into `512×512` patches.
 
-We evaluated our method on the [BRATS2020 dataset](https://www.med.upenn.edu/cbica/brats2020/data.html), and on the [CheXpert dataset](https://stanfordmlgroup.github.io/competitions/chexpert/).
-A mini-example how the data needs to be stored can be found in the folder *data*. To train or evaluate on the desired dataset, set `--dataset brats` or `--dataset chexpert` respectively. 
+`reco` is normalized (min-max) per file at load time.
 
-## Usage
+## Workflows
 
-We set the flags as follows:
-```
-MODEL_FLAGS="--image_size 256 --num_channels 128 --class_cond True --num_res_blocks 2 --num_heads 1 --learn_sigma True --use_scale_shift_norm False --attention_resolutions 16"
-DIFFUSION_FLAGS="--diffusion_steps 1000 --noise_schedule linear --rescale_learned_sigmas False --rescale_timesteps False"
-TRAIN_FLAGS="--lr 1e-4 --batch_size 10"
-CLASSIFIER_FLAGS="--image_size 256 --classifier_attention_resolutions 32,16,8 --classifier_depth 4 --classifier_width 32 --classifier_pool attention --classifier_resblock_updown True --classifier_use_scale_shift_norm True"
-SAMPLE_FLAGS="--batch_size 1 --num_samples 1 --timestep_respacing ddim1000 --use_ddim True"
-```
-To train the classification model, run
-```
-python scripts/classifier_train.py --data_dir path_to_traindata --dataset brats_or_chexpert $TRAIN_FLAGS $CLASSIFIER_FLAGS
-```
-To train the diffusion model, run
-```
-python scripts/image_train.py --data_dir --data_dir path_to_traindata --datasaet brats_or_chexpert  $MODEL_FLAGS $DIFFUSION_FLAGS $TRAIN_FLAGS
-```
-The model will be saved in the *results* folder.
+The three CLI entry points each take dozens of flags. The
+`model_flags_SBND.sh` / `model_flags_SBND_anisotropic.sh` /
+`classifier_flags.sh` shell scripts at the repo root export the
+production flag bundles; source one and reference its variables on the
+command line.
 
-For image-to-image translation to a healthy subject on the test set, run
-```
-python scripts/classifier_sample_known.py  --data_dir path_to_testdata  --model_path ./results/model.pt --classifier_path ./results/classifier.pt --dataset brats_or_chexpert --classifier_scale 100 --noise_level 500 $MODEL_FLAGS $DIFFUSION_FLAGS $CLASSIFIER_FLAGS  $SAMPLE_FLAGS 
-```
-A visualization of the sampling process is done using [Visdom](https://github.com/fossasia/visdom).
+### 1. Train the diffusion model
 
-
-## Comparing Methods
-
-### FixedPoint-GAN
-
-We follow the implementation given in this [repo](https://github.com/mahfuzmohammad/Fixed-Point-GAN). We choose λ<sub>cls</sub>=1, λ<sub>gp</sub>=λ<sub>id</sub>=λ<sub>rec</sub>=10,  and train our model for 150 epochs. The batch size is set to 10, and the learning rate to 10<sup>-4</sup>.
-
-### VAE
-
-We follow the implementation given in this [repo](https://github.com/aubreychen9012/cAAE) and train the model for 500 epochs.  The batch size is set to 10, and the learning rate to 10<sup>-4</sup>.
-
-
-### DDPM
-For sampling using the DDPM approach, run 
-```
-python scripts/classifier_sample_known.py  --data_dir path_to_testdata  --model_path ./results/model.pt --classifier_path ./results/classifier.pt  --dataset brats_or_chexpert --classifier_scale 100 --noise_level 500 $MODEL_FLAGS $DIFFUSION_FLAGS $CLASSIFIER_FLAGS 
+```bash
+source model_flags_SBND.sh
+python scripts/image_train.py $IMAGE_TRAIN_FLAGS
 ```
 
+Anisotropic noise (signal-proportional perturbations on the LArTPC
+charge image) is enabled by `model_flags_SBND_anisotropic.sh` instead.
 
+### 2. Train the classifier (on noisy diffusion-corrupted images)
+
+```bash
+source classifier_flags.sh
+python scripts/classifier_train.py $CLASSIFIER_TRAIN_FLAGS
+```
+
+### 3. Run anomaly detection
+
+```bash
+python scripts/classifier_sample_known.py \
+    --data_dir <path_to_test_npz> \
+    --model_path ./results/model<step>.pt \
+    --classifier_path ./results/classifier_model_<step>.pt \
+    --classifier_scale 100 --noise_level 500 \
+    $MODEL_FLAGS $DIFFUSION_FLAGS $CLASSIFIER_FLAGS $SAMPLE_FLAGS
+```
+
+`run_translation.sh` is a working example.
+
+## Checkpoints
+
+Saved to the run's log directory as `model<step>.pt`,
+`ema_<rate>_<step>.pt`, `opt<step>.pt` (diffusion training) and
+`classifier_model_<step>.pt` / `classifier_opt_<step>.pt` (classifier
+training).
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+Covers the diffusion math (`linear`/`cosine` schedules, `q_sample`,
+respacing), the schedule samplers, the SBND `.npz` dataset path, the
+UNet and classifier factory shapes, and the EMA / timestep-embedding
+helpers.
+
+## Distributed training
+
+Uses `torch.distributed` via `guided_diffusion/dist_util.py`. Launch
+multi-GPU runs with `mpiexec` or `torchrun`; single-GPU works without
+any wrapper.
