@@ -62,6 +62,30 @@ python scripts/classifier_sample_known.py \
 
 `run_translation.sh` is a working example.
 
+### 4. VAE / CAE baseline anomaly detectors
+
+Reconstruction-based baselines (`guided_diffusion/autoencoder.py`) that
+train and run through the same infrastructure; the anomaly map is
+`input - reconstruction`. See `TRAINING_AUTOENCODERS.md` for a full run
+guide and `CITATIONS.md` for the reference implementations/papers.
+
+```bash
+# Train (flag scripts: model_flags_{VAE,CAE}_{SBND,ICARUS}.sh)
+source model_flags_VAE_SBND.sh
+python scripts/autoencoder_train.py $AE_TRAIN_FLAGS --log_dir ./results/vae-sbnd
+
+# Inference: writes input/reco/saliency .npz + anomaly-map PNGs
+python scripts/autoencoder_sample.py $MODEL_FLAGS \
+    --model_path ./results/vae-sbnd/model<step>.pt \
+    --data_dir <path_to_test_data> --num_batches 10
+
+# Minimal demos of the trained SBND models: generate images from random
+# noise and produce anomaly maps for one example SBND file (read over xrootd,
+# hence the preload; a local .h5/.npz --input needs none)
+LD_PRELOAD=/usr/lib64/libXrdPosixPreload.so HDF5_USE_FILE_LOCKING=FALSE \
+    python scripts/vae_sbnd_demo.py   # or scripts/cae_sbnd_demo.py
+```
+
 ## Checkpoints
 
 Saved to the run's log directory as `model<step>.pt`,

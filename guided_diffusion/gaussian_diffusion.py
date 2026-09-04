@@ -8,7 +8,6 @@ from PIL import Image
 from torch.autograd import Variable
 import enum
 import torch.nn.functional as F
-from torchvision.utils import save_image
 import torch
 import math
 import numpy as np
@@ -17,7 +16,6 @@ from .train_util import visualize
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
 from scipy import ndimage
-from torchvision import transforms
 import matplotlib.pyplot as plt
 def standardize(img):
     mean = th.mean(img)

@@ -7,9 +7,14 @@ import numpy as np
 import h5py
 import torch as th
 from torch.utils.data import DataLoader, IterableDataset, Dataset, BatchSampler, RandomSampler, SequentialSampler
-from torchvision import transforms
 from .train_util import visualize
 from scipy import ndimage
+
+# Divisor applied to ICARUS DNN-ROI "deconvolved_signal" images before the
+# [-1, 1] clip. Measured on /exp/sbnd/data/users/gputnam/DNN-ROI-images/:
+# 99th-percentile |signal| ~= 1.17, max ~= 3.4, so /2 keeps ~99.9% of pixels
+# inside the clip.
+DECONV_SIGNAL_SCALE = 2.0
 
 
 def load_data(
@@ -46,13 +51,13 @@ def load_data(
     """
     if not data_dir:
         raise ValueError("unspecified data directory")
-    all_files = _list_image_files_recursively(data_dir)
 
     classes = None
 
     if class_cond:
         # Assume classes are the first part of the filename,
         # before an underscore.
+        all_files = _list_image_files_recursively(data_dir)
 
         class_names =[path.split("/")[6] for path in all_files] #9 or 3
         print('classnames', class_names)
@@ -88,6 +93,86 @@ def load_data(
         yield from loader
 
 
+def _tile(arr, nrows, ncols):
+    """Cut a 2-D array into a (N, nrows, ncols) stack of non-overlapping tiles."""
+    h, w = arr.shape
+    return (
+        arr[:(h // nrows) * nrows, :(w // ncols) * ncols]
+        .reshape(h // nrows, nrows, -1, ncols)
+        .swapaxes(1, 2)
+        .reshape(-1, nrows, ncols)
+    )
+
+
+def load_image_file(path, resolution):
+    """
+    Load one data file into model-ready tiles.
+
+    Returns (images, truth), both float32 arrays of shape (N, 1, H, W) with
+    images already scaled and clipped to [-1, 1] exactly as ImageDataset feeds
+    them to the models. Supported formats:
+
+    - ``.npz`` with ``reco``/``truth`` arrays of shape (N, 1, H, W);
+    - SBND raw-waveform ``.h5``: per-event groups holding a ``raw`` dataset of
+      shape (5638, T); each event is split into its three wire planes, divided
+      by the per-plane charge scale, and cut into 512x512 tiles (truth is all
+      ones - no true charge is stored);
+    - ICARUS DNN-ROI ``.h5``: per-event groups with ``deconvolved_signal``
+      (and optionally ``true_number_electrons``), divided by
+      DECONV_SIGNAL_SCALE and cut into ``resolution`` x ``resolution`` tiles.
+
+    ``path`` may be a local path or a ``root://`` URL (the latter needs the
+    xrootd POSIX preload; see model_flags_VAE_SBND.sh).
+    """
+    path = str(path)
+    if path.endswith(".npz"):
+        numpy_img = np.load(path)
+        images = visualize(numpy_img["reco"]).astype(np.float32)
+        truth = numpy_img["truth"].astype(np.float32)
+        return images, truth
+
+    if not path.endswith(".h5"):
+        raise ValueError(f"Unsupported image file (expected .npz or .h5): {path}")
+
+    with h5py.File(path, "r") as f:
+        evs = list(f.keys())
+        # ICARUS DNN-ROI format: per-event groups holding a
+        # deconvolved_signal image (and true_number_electrons).
+        is_dnnroi = len(evs) > 0 and "deconvolved_signal" in f[evs[0]]
+        if is_dnnroi:
+            arrs = [f[ev]["deconvolved_signal"][:].astype(np.float32) for ev in evs]
+            trues = [
+                f[ev]["true_number_electrons"][:].astype(np.float32)
+                if "true_number_electrons" in f[ev]
+                else np.ones_like(arr)
+                for ev, arr in zip(evs, arrs)
+            ]
+        else:
+            # SBND raw-waveform format
+            arrs = [f[ev]["raw"][:] for ev in evs]
+
+    if is_dnnroi:
+        nrows = ncols = resolution
+        allarrs = [_tile(arr / DECONV_SIGNAL_SCALE, nrows, ncols) for arr in arrs]
+        alltrues = [_tile(true, nrows, ncols) for true in trues]
+        images = visualize(np.expand_dims(np.concatenate(allarrs), axis=1)).astype(np.float32)
+        truth = np.expand_dims(np.concatenate(alltrues), axis=1).astype(np.float32)
+        return images, truth
+
+    nrows, ncols = (512, 512)
+    plane_boundaries = [0, 1984, 3968, 5638]
+    allarrs = []
+    for arr in arrs:
+        for planeno, (wlo, whi) in enumerate(zip(plane_boundaries[:-1], plane_boundaries[1:])):
+            # scale charge by value
+            cscale = [200., 100., 200.][planeno]
+            allarrs.append(_tile(arr[wlo:whi, :] / cscale, nrows, ncols))
+    images = visualize(np.expand_dims(np.concatenate(allarrs), axis=1)).astype(np.float32)
+    # dummy charge, for now
+    truth = np.ones((images.shape[0], 1, nrows, ncols)).astype(np.float32)
+    return images, truth
+
+
 def _list_image_files_recursively(data_dir):
     results = []
     for entry in sorted(bf.listdir(data_dir)):
@@ -118,7 +203,18 @@ class ImageDataset(IterableDataset):
     ):
         super().__init__()
         self.resolution = resolution
-        self.local_images = [p for ext in exts for p in Path(f'{image_paths}').glob(f'**/*.{ext}')]
+        if str(image_paths).endswith(".txt"):
+            # File-list mode: one path (or root:// URL) per line. Used for
+            # data served over xrootd, where directory globbing cannot run
+            # (and must not: XrdCl is not fork-safe, so the parent process
+            # has to stay clear of xrootd before DataLoader workers fork).
+            with open(image_paths) as f:
+                self.local_images = [line.strip() for line in f if line.strip()]
+        elif any(str(image_paths).endswith("." + ext) for ext in exts):
+            # A single data file (local path or root:// URL).
+            self.local_images = [str(image_paths)]
+        else:
+            self.local_images = [p for ext in exts for p in Path(f'{image_paths}').glob(f'**/*.{ext}')]
 
         self.local_classes = None if classes is None else classes[shard:][::num_shards]
         self.random_crop = random_crop
@@ -151,33 +247,7 @@ class ImageDataset(IterableDataset):
             name=str(path).split("/")[-1].split(".")[0]
             self._cache_fname = name
 
-            if str(path).endswith(".npz"):
-                numpy_img = np.load(path)
-                self._cache_file = visualize(numpy_img["reco"]).astype(np.float32)
-                self._cache_true = numpy_img["truth"].astype(np.float32)
-            elif str(path).endswith(".h5"):
-                with h5py.File(str(path), "r") as f:
-                    # scale charge by value
-                    arrs = [f[ev]["raw"][:] for ev in f.keys()]
-                allarrs = []
-                for arr in arrs:
-                    nrows, ncols = (512, 512)
-                    plane_boundaries = [0, 1984, 3968, 5638]
-                    for planeno, (wlo, whi) in enumerate(zip(plane_boundaries[:-1], plane_boundaries[1:])):
-                        cscale = [200., 100., 200.][planeno]
-                        
-                        planearr = arr[wlo:whi, :]/cscale
-                        h, w = planearr.shape
-                        ll = planearr[:(h//nrows)*nrows, :(w//nrows)*nrows].reshape(h//nrows, nrows, -1, ncols).swapaxes(1,2).reshape(-1, nrows, ncols)
-                        allarrs.append(ll)
-                        
-                self._cache_file = visualize(np.expand_dims(np.concatenate(allarrs), axis=1)).astype(np.float32)
-                # dummy charge, for now
-                self._cache_true = np.ones((self._cache_file.shape[0], 1, nrows, ncols)).astype(np.float32)
-                
-            else: 
-                assert(False)
-                    
+            self._cache_file, self._cache_true = load_image_file(path, self.resolution)
 
 
             # weight by sum of true charge

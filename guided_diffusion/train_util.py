@@ -204,16 +204,7 @@ class TrainLoop:
             if self.step % self.plot_interval == 0 and self.step > 0:
                 # make validation plots
                 vbatch, _ = next(self.validationl)
-                for ibatch in range(min(4, vbatch.shape[0])):
-                    outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddpm/img-%i/" % (self.step, ibatch)
-                    os.makedirs(outdir, exist_ok=True)
-                    with th.no_grad():
-                        validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch])
-                for ibatch in range(min(4, vbatch.shape[0])):
-                    outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddim/img-%i/" % (self.step, ibatch)
-                    os.makedirs(outdir, exist_ok=True)
-                    with th.no_grad():
-                        validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch], ddpm=False)
+                self._make_validation_plots(vbatch)
 
             self.step += 1
             pbar.update(1)
@@ -222,6 +213,18 @@ class TrainLoop:
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
+
+    def _make_validation_plots(self, vbatch):
+        for ibatch in range(min(4, vbatch.shape[0])):
+            outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddpm/img-%i/" % (self.step, ibatch)
+            os.makedirs(outdir, exist_ok=True)
+            with th.no_grad():
+                validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch])
+        for ibatch in range(min(4, vbatch.shape[0])):
+            outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ddim/img-%i/" % (self.step, ibatch)
+            os.makedirs(outdir, exist_ok=True)
+            with th.no_grad():
+                validation_plots.validation_plots(self.diffusion, self.ddp_model, outdir, vbatch[ibatch], ddpm=False)
 
     def run_validation_step(self, batch, cond, batch_weights=None, pixel_weights=None):
         with th.no_grad():
@@ -335,7 +338,28 @@ class TrainLoop:
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
-        dist.barrier(device_ids=[0])
+        # device_ids is only supported (and only needed) by the NCCL backend;
+        # it raises on gloo/CPU runs.
+        if dist.get_backend() == "nccl":
+            dist.barrier(device_ids=[0])
+        else:
+            dist.barrier()
+
+
+class AETrainLoop(TrainLoop):
+    """
+    TrainLoop for the VAE/CAE anomaly detectors (see autoencoder.py). Only
+    the validation plots differ: autoencoders reconstruct in a single forward
+    pass, so the diffusion q_sample/sample-loop plots are replaced with
+    original/reconstruction/residual panels.
+    """
+
+    def _make_validation_plots(self, vbatch):
+        for ibatch in range(min(4, vbatch.shape[0])):
+            outdir = logger.Logger.CURRENT.dir + "/validation-plots/step-%i-ae/img-%i/" % (self.step, ibatch)
+            os.makedirs(outdir, exist_ok=True)
+            with th.no_grad():
+                validation_plots.ae_validation_plots(self.ddp_model, outdir, vbatch[ibatch])
 
 
 def parse_resume_step_from_filename(filename):
